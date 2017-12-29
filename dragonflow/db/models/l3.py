@@ -65,3 +65,35 @@ class FloatingIp(mf.ModelBase, mixins.Version, mixins.Topic,
     lport = df_fields.ReferenceField(l2.LogicalPort)
     floating_lport = df_fields.ReferenceField(l2.LogicalPort)
     lrouter = df_fields.ReferenceField(LogicalRouter)
+
+
+@mf.register_model
+@mf.construct_nb_db_model(
+    indexes={
+        'lport': 'lport.id',
+    },
+)
+class PAT(mf.ModelBase, mixins.Version, mixins.Topic, mixins.BasicEvents):
+    table_name = 'pat'
+
+    ip_address = df_fields.IpAddressField()
+    lport = df_fields.ReferenceField(l2.LogicalPort)
+
+
+@mf.register_model
+@mf.construct_nb_db_model(
+    indexes={
+        'pat': 'pat.id',
+        'lport': 'lport.id',
+    },
+)
+class PATEntry(mf.ModelBase, mixins.Version, mixins.Topic,
+                 mixins.BasicEvents):
+    table_name = 'pat_entry'
+
+    pat = df_fields.ReferenceField(PAT)
+    pat_l4_port = df_fields.L4PortField()
+    fixed_ip_address = df_fields.IpAddressField()
+    fixed_l4_port = df_fields.L4PortField()
+    lport = df_fields.ReferenceField(l2.LogicalPort)
+    lrouter = df_fields.ReferenceField(LogicalRouter)
