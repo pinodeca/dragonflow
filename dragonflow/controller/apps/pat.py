@@ -14,25 +14,17 @@
 #    under the License.
 
 from neutron_lib import constants as n_const
+from oslo_config import cfg
 from oslo_log import log
-from ryu.lib.packet import ethernet
-from ryu.lib.packet import icmp
-from ryu.lib.packet import in_proto
-from ryu.lib.packet import ipv4
-from ryu.lib.packet import packet
+from ryu.lib.packet import ethernet, icmp, in_proto, ipv4, packet
 from ryu.ofproto import ether
 
-from dragonflow.common import utils as df_utils
 from dragonflow import conf as cfg
-from dragonflow.controller.common import arp_responder
-from dragonflow.controller.common import constants as const
-from dragonflow.controller.common import icmp_error_generator
-from dragonflow.controller import df_base_app
-from dragonflow.controller import port_locator
-from dragonflow.db.models import constants as model_constants
-from dragonflow.db.models import l2
-from dragonflow.db.models import l3
-
+from dragonflow.common import utils as df_utils
+from dragonflow.controller import df_base_app, port_locator
+from dragonflow.controller.common import arp_responder, constants as const, \
+    icmp_error_generator
+from dragonflow.db.models import constants as model_constants, l2, l3
 
 LOG = log.getLogger(__name__)
 
@@ -42,9 +34,11 @@ INGRESS = 'ingress'
 
 
 class PATApp(df_base_app.DFlowApp):
-
     def __init__(self, *args, **kwargs):
         super(PATApp, self).__init__(*args, **kwargs)
+        # PATApp is currently piggy-backing on the DNATApp, so it doesn't
+        # create its own tables and therefore will not handle packet misses.
+        # TODO(pino): handle ICMP errors separate from DNATApp.
 
     def _get_vm_gateway_mac(self, pat_entry):
         for router_port in pat_entry.lrouter.ports:
@@ -99,46 +93,6 @@ class PATApp(df_base_app.DFlowApp):
             **kwargs
         )
 
-    def _install_ingress_capture_flow(self, pat):
-        # Capture flow:
-        # Each packet bound for a pat port is forwarded to DNAT table
-        # This is done so we can be the handler for any PACKET_INs there
-        self.mod_flow(
-            table_id=const.EGRESS_TABLE,
-            priority=const.PRIORITY_HIGH,
-            match=self._get_pat_ingress_match(pat),
-            inst=[
-                self.parser.OFPInstructionGotoTable(const.INGRESS_DNAT_TABLE),
-            ],
-        )
-
-    def _uninstall_ingress_capture_flow(self, pat):
-        self.mod_flow(
-            command=self.ofproto.OFPFC_DELETE_STRICT,
-            table_id=const.EGRESS_TABLE,
-            priority=const.PRIORITY_HIGH,
-            match=self._get_pat_ingress_match(pat),
-        )
-
-    def _install_ingress_translate_flow(self, pat_entry):
-        self.mod_flow(
-            table_id=const.INGRESS_DNAT_TABLE,
-            priority=const.PRIORITY_MEDIUM,
-            match=self._get_pat_entry_ingress_match(pat_entry),
-            actions=self._get_ingress_translate_actions(pat_entry) + [
-                self.parser.NXActionResubmitTable(
-                    table_id=const.L2_LOOKUP_TABLE),
-            ],
-        )
-
-    def _uninstall_ingress_translate_flow(self, pat_entry):
-        self.mod_flow(
-            command=self.ofproto.OFPFC_DELETE_STRICT,
-            table_id=const.INGRESS_DNAT_TABLE,
-            priority=const.PRIORITY_MEDIUM,
-            match=self._get_pat_entry_ingress_match(pat_entry),
-        )
-
     def _get_pat_egress_match(self, pat_entry, **kwargs):
         return self.parser.OFPMatch(
             metadata=pat_entry.lport.lswitch.unique_key,
@@ -165,7 +119,46 @@ class PATApp(df_base_app.DFlowApp):
             parser.OFPActionSetField(reg6=pat_entry.pat.lport.unique_key)
         ]
 
-    def _install_egress_capture_flow(self, pat_entry):
+    def _install_pat_ingress_flows(self, pat):
+        self._get_arp_responder(pat).add()
+        self.mod_flow(
+            table_id=const.EGRESS_TABLE,
+            priority=const.PRIORITY_HIGH,
+            match=self._get_pat_ingress_match(pat),
+            inst=[
+                self.parser.OFPInstructionGotoTable(const.INGRESS_DNAT_TABLE),
+            ],
+        )
+
+    def _uninstall_pat_ingress_flows(self, pat):
+        self._get_arp_responder(pat).remove()
+        self.mod_flow(
+            command=self.ofproto.OFPFC_DELETE_STRICT,
+            table_id=const.EGRESS_TABLE,
+            priority=const.PRIORITY_HIGH,
+            match=self._get_pat_ingress_match(pat),
+        )
+
+    def _install_pat_entry_ingress_flows(self, pat_entry):
+        self.mod_flow(
+            table_id=const.INGRESS_DNAT_TABLE,
+            priority=const.PRIORITY_MEDIUM,
+            match=self._get_pat_entry_ingress_match(pat_entry),
+            actions=self._get_ingress_translate_actions(pat_entry) + [
+                self.parser.NXActionResubmitTable(
+                    table_id=const.L2_LOOKUP_TABLE),
+            ],
+        )
+
+    def _uninstall_pat_entry_ingress_flows(self, pat_entry):
+        self.mod_flow(
+            command=self.ofproto.OFPFC_DELETE_STRICT,
+            table_id=const.INGRESS_DNAT_TABLE,
+            priority=const.PRIORITY_MEDIUM,
+            match=self._get_pat_entry_ingress_match(pat_entry),
+        )
+
+    def _install_egress_flows(self, pat_entry):
         # Capture flow: relevant packets in L3 go to EGRESS_DNAT
         self.mod_flow(
             table_id=const.L3_LOOKUP_TABLE,
@@ -175,16 +168,6 @@ class PATApp(df_base_app.DFlowApp):
                 self.parser.OFPInstructionGotoTable(const.EGRESS_DNAT_TABLE)
             ],
         )
-
-    def _uninstall_egress_capture_flow(self, pat_entry):
-        self.mod_flow(
-            command=self.ofproto.OFPFC_DELETE_STRICT,
-            table_id=const.L3_LOOKUP_TABLE,
-            priority=const.PRIORITY_MEDIUM_LOW,
-            match=self._get_pat_egress_match(pat_entry),
-        )
-
-    def _install_egress_translate_flow(self, pat_entry):
         self.mod_flow(
             table_id=const.EGRESS_DNAT_TABLE,
             priority=const.PRIORITY_MEDIUM,
@@ -196,7 +179,13 @@ class PATApp(df_base_app.DFlowApp):
             ],
         )
 
-    def _uninstall_egress_translate_flow(self, pat_entry):
+    def _uninstall_egress_flows(self, pat_entry):
+        self.mod_flow(
+            command=self.ofproto.OFPFC_DELETE_STRICT,
+            table_id=const.L3_LOOKUP_TABLE,
+            priority=const.PRIORITY_MEDIUM_LOW,
+            match=self._get_pat_egress_match(pat_entry),
+        )
         self.mod_flow(
             command=self.ofproto.OFPFC_DELETE_STRICT,
             table_id=const.EGRESS_DNAT_TABLE,
@@ -204,54 +193,19 @@ class PATApp(df_base_app.DFlowApp):
             match=self._get_pat_egress_match(pat_entry),
         )
 
-    def _install_egress_icmp_flows(self):
-        # Add flows to packet-in icmp time exceed and icmp unreachable message
-        # TODO(pino): pat app only should only handle ICMP errors that result
-        # from packets sent to the PAT IP and l4 port. If the VM is assigned
-        # a FloatingIP, then ICMP errors may be responses sent to the FIP,
-        # the PAT, or the VM's private address.
-
-    def _uninstall_egress_icmp_flows(self):
-        # TODO(pino): see comments in _install_egress_icmp_flows
-        pass
-
-    def _install_pat_ingress_flows(self, pat):
-        # Install flows at the controller where the PAT's port is bound.
-        self._get_arp_responder(pat).add()
-        self._install_ingress_capture_flow(pat)
-
-    def _uninstall_pat_ingress_flows(self, pat):
-        self._get_arp_responder(pat).remove()
-        self._uninstall_ingress_capture_flow(pat)
-
-    def _install_pat_entry_ingress_flows(self, pat_entry):
-        # Install flows at the controller where the PATEntry's port is bound.
-        self._install_ingress_translate_flow(pat_entry)
-
-    def _uninstall_pat_entry_ingress_flows(self, pat_entry):
-        self._uninstall_ingress_translate_flow(pat_entry)
-
-    def _install_egress_flows(self, pat_entry):
-        self._install_egress_capture_flow(pat_entry)
-        self._install_egress_translate_flow(pat_entry)
-
-    def _uninstall_egress_flows(self, pat_entry):
-        self._uninstall_egress_capture_flow(pat_entry)
-        self._uninstall_egress_translate_flow(pat_entry)
-
     def _get_pats_by_lport(self, lport):
         return self.db_store.get_all(
             l3.PAT(lport=lport.id),
             index=l3.PAT.get_index('lport'),
         )
 
-    def _get_entries_by_pat(self, pat):
+    def _get_pat_entries_by_pat(self, pat):
         return self.db_store.get_all(
             l3.PATEntry(pat=pat.id),
             index=l3.PATEntry.get_index('pat'),
         )
 
-    def _get_entries_by_lport(self, lport):
+    def _get_pat_entries_by_lport(self, lport):
         return self.db_store.get_all(
             l3.PATEntry(lport=lport.id),
             index=l3.PATEntry.get_index('lport'),
@@ -280,10 +234,13 @@ class PATApp(df_base_app.DFlowApp):
 
     @df_base_app.register_event(l3.PAT, model_constants.EVENT_CREATED)
     def _create_pat(self, pat):
-        # The controller local to the PAT's port installs the ARP responder,
-        # ICMP handler, ingress capture flows...
-        if pat.lport.is_local:
-            self._install_pat_ingress_flows(pat)
+        binding = l2.PortBinding(type=l2.BINDING_CHASSIS,
+                                 chassis=pat.chassis)
+        port_locator.set_port_binding(pat.lport, binding)
+        if binding.is_local:
+            pat.lport.emit_bind_local()
+        else:
+            pat.lport.emit_bind_remote()
 
     @df_base_app.register_event(l3.PAT, model_constants.EVENT_UPDATED)
     def _update_pat(self, pat, orig_pat):
@@ -292,8 +249,12 @@ class PATApp(df_base_app.DFlowApp):
 
     @df_base_app.register_event(l3.PAT, model_constants.EVENT_DELETED)
     def _delete_pat(self, pat):
-        if pat.lport.is_local:
-            self._uninstall_pat_ingress_flows(pat)
+        was_local = pat.lport.is_local
+        port_locator.clear_port_binding(pat.lport)
+        if was_local:
+            pat.lport.emit_unbind_local()
+        else:
+            pat.lport.emit_unbind_remote()
 
     @df_base_app.register_event(l3.PATEntry, model_constants.EVENT_CREATED)
     def _create_pat_entry(self, pat_entry):

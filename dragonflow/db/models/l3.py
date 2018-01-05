@@ -14,6 +14,7 @@ from jsonmodels import fields
 
 import dragonflow.db.field_types as df_fields
 import dragonflow.db.model_framework as mf
+from dragonflow.db.models import core
 from dragonflow.db.models import host_route
 from dragonflow.db.models import l2
 from dragonflow.db.models import mixins
@@ -78,6 +79,7 @@ class PAT(mf.ModelBase, mixins.Version, mixins.Topic, mixins.BasicEvents):
 
     ip_address = df_fields.IpAddressField()
     lport = df_fields.ReferenceField(l2.LogicalPort)
+    chassis = df_fields.ReferenceField(core.Chassis)
 
 
 @mf.register_model
