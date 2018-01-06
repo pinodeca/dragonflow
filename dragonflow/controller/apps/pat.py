@@ -62,7 +62,7 @@ class PATApp(df_base_app.DFlowApp):
             source_port_key=pat.lport.unique_key,
         )
 
-    def _get_ingress_translate_actions(self, pat_entry):
+    def _get_ingress_nat_actions(self, pat_entry):
         vm_gateway_mac = self._get_vm_gateway_mac(pat_entry)
         if vm_gateway_mac is None:
             vm_gateway_mac = pat_entry.pat.lport.mac
@@ -93,7 +93,7 @@ class PATApp(df_base_app.DFlowApp):
             **kwargs
         )
 
-    def _get_pat_egress_match(self, pat_entry, **kwargs):
+    def _get_egress_match(self, pat_entry, **kwargs):
         return self.parser.OFPMatch(
             metadata=pat_entry.lport.lswitch.unique_key,
             reg6=pat_entry.lport.unique_key,
@@ -120,17 +120,22 @@ class PATApp(df_base_app.DFlowApp):
         ]
 
     def _install_pat_ingress_flows(self, pat):
-        self._get_arp_responder(pat).add()
+        match = self._get_pat_ingress_match(pat)
+        arp = self._get_arp_responder(pat)
+        arp.add()
+        LOG.debug('install ingress flows for PAT {} with match {} and ARP '
+                  '{}'.format(pat, match, arp))
         self.mod_flow(
             table_id=const.EGRESS_TABLE,
             priority=const.PRIORITY_HIGH,
-            match=self._get_pat_ingress_match(pat),
+            match=match,
             inst=[
                 self.parser.OFPInstructionGotoTable(const.INGRESS_DNAT_TABLE),
             ],
         )
 
     def _uninstall_pat_ingress_flows(self, pat):
+        LOG.debug('uninstall ingress flows for PAT {}'.format(pat))
         self._get_arp_responder(pat).remove()
         self.mod_flow(
             command=self.ofproto.OFPFC_DELETE_STRICT,
@@ -140,17 +145,23 @@ class PATApp(df_base_app.DFlowApp):
         )
 
     def _install_pat_entry_ingress_flows(self, pat_entry):
+        match = self._get_pat_entry_ingress_match(pat_entry)
+        nat_actions = self._get_ingress_nat_actions(pat_entry) + [
+                self.parser.NXActionResubmitTable(
+                    table_id=const.L2_LOOKUP_TABLE)]
+        LOG.debug('install egress flows for PATEntry {} with match {} '
+                  'and translation {}'.format(pat_entry,
+                                              match,
+                                              nat_actions))
         self.mod_flow(
             table_id=const.INGRESS_DNAT_TABLE,
             priority=const.PRIORITY_MEDIUM,
-            match=self._get_pat_entry_ingress_match(pat_entry),
-            actions=self._get_ingress_translate_actions(pat_entry) + [
-                self.parser.NXActionResubmitTable(
-                    table_id=const.L2_LOOKUP_TABLE),
-            ],
+            match=match,
+            actions=nat_actions,
         )
 
     def _uninstall_pat_entry_ingress_flows(self, pat_entry):
+        LOG.debug('uninstall ingress flows for PATEntry {}'.format(pat_entry))
         self.mod_flow(
             command=self.ofproto.OFPFC_DELETE_STRICT,
             table_id=const.INGRESS_DNAT_TABLE,
@@ -159,11 +170,19 @@ class PATApp(df_base_app.DFlowApp):
         )
 
     def _install_egress_flows(self, pat_entry):
+        match = self._get_egress_match(pat_entry)
+        nat_actions = self._get_egress_nat_actions(pat_entry) + [
+                self.parser.NXActionResubmitTable(
+                    table_id=const.L2_LOOKUP_TABLE)]
+        LOG.debug('install egress flows for PATEntry {} with match {} '
+                  'and translation {}'.format(pat_entry,
+                                              match,
+                                              nat_actions))
         # Capture flow: relevant packets in L3 go to EGRESS_DNAT
         self.mod_flow(
             table_id=const.L3_LOOKUP_TABLE,
             priority=const.PRIORITY_MEDIUM_LOW,
-            match=self._get_pat_egress_match(pat_entry),
+            match=match,
             inst=[
                 self.parser.OFPInstructionGotoTable(const.EGRESS_DNAT_TABLE)
             ],
@@ -171,26 +190,23 @@ class PATApp(df_base_app.DFlowApp):
         self.mod_flow(
             table_id=const.EGRESS_DNAT_TABLE,
             priority=const.PRIORITY_MEDIUM,
-            match=self._get_pat_egress_match(pat_entry),
-            actions=self._get_egress_nat_actions(pat_entry) + [
-                self.parser.NXActionResubmitTable(
-                    table_id=const.L2_LOOKUP_TABLE,
-                )
-            ],
+            match=match,
+            actions=nat_actions,
         )
 
     def _uninstall_egress_flows(self, pat_entry):
+        LOG.debug('uninstall egress flows for PATEntry {}'.format(pat_entry))
         self.mod_flow(
             command=self.ofproto.OFPFC_DELETE_STRICT,
             table_id=const.L3_LOOKUP_TABLE,
             priority=const.PRIORITY_MEDIUM_LOW,
-            match=self._get_pat_egress_match(pat_entry),
+            match=self._get_egress_match(pat_entry),
         )
         self.mod_flow(
             command=self.ofproto.OFPFC_DELETE_STRICT,
             table_id=const.EGRESS_DNAT_TABLE,
             priority=const.PRIORITY_MEDIUM,
-            match=self._get_pat_egress_match(pat_entry),
+            match=self._get_egress_match(pat_entry),
         )
 
     def _get_pats_by_lport(self, lport):
@@ -213,34 +229,37 @@ class PATApp(df_base_app.DFlowApp):
 
     @df_base_app.register_event(l2.LogicalPort, l2.EVENT_BIND_LOCAL)
     def _local_port_bound(self, lport):
-        # If the port belongs to a PAT, install the ingress flows for the PAT
-        # and all related PAT Entries.
-        for pat in self._get_pats_by_lport(lport):
-            self._install_pat_ingress_flows(pat)
-            for pat_entry in self.get_pat_entries_by_pat(pat):
-                self._install_pat_entry_ingress_flows(pat_entry)
-        # If the port belongs to a PAT entry, install the egress flows.
-        for pat_entry in self.get_pat_entries_by_lport(lport):
+        for pat_entry in self._get_pat_entries_by_lport(lport):
+            LOG.debug('Locally bound port is used by PATEntry '
+                      '{}'.format(pat_entry))
             self._install_egress_flows(pat_entry)
 
     @df_base_app.register_event(l2.LogicalPort, l2.EVENT_UNBIND_LOCAL)
     def _local_port_unbound(self, lport):
-        for pat in self._get_pats_by_lport(lport):
-            self._uninstall_pat_ingress_flows(pat)
-            for pat_entry in self.get_pat_entries_by_pat(pat):
-                self._uninstall_pat_entry_ingress_flows(pat_entry)
-        for pat_entry in self.get_pat_entries_by_lport(lport):
+        for pat_entry in self._get_pat_entries_by_lport(lport):
+            LOG.debug('Locally unbound port is used by PATEntry '
+                      '{}'.format(pat_entry))
             self._uninstall_egress_flows(pat_entry)
 
     @df_base_app.register_event(l3.PAT, model_constants.EVENT_CREATED)
     def _create_pat(self, pat):
+        if pat.chassis is None: return
+        LOG.debug('PAT {} was created or updated; creating binding for its '
+                  'lport {}'.format(pat, pat.lport))
         binding = l2.PortBinding(type=l2.BINDING_CHASSIS,
                                  chassis=pat.chassis)
         port_locator.set_port_binding(pat.lport, binding)
         if binding.is_local:
             pat.lport.emit_bind_local()
+            self._install_pat_ingress_flows(pat)
+            for pat_entry in self._get_pat_entries_by_pat(pat):
+                self._install_pat_entry_ingress_flows(pat_entry)
         else:
             pat.lport.emit_bind_remote()
+
+        for pat_entry in self._get_pat_entries_by_pat(pat):
+            if pat_entry.lport.is_local:
+                self._install_egress_flows(pat_entry)
 
     @df_base_app.register_event(l3.PAT, model_constants.EVENT_UPDATED)
     def _update_pat(self, pat, orig_pat):
@@ -249,15 +268,26 @@ class PATApp(df_base_app.DFlowApp):
 
     @df_base_app.register_event(l3.PAT, model_constants.EVENT_DELETED)
     def _delete_pat(self, pat):
+        if pat.chassis is None: return
+        LOG.debug('PAT {} was created or updated; remove binding'.format(pat))
         was_local = pat.lport.is_local
         port_locator.clear_port_binding(pat.lport)
         if was_local:
             pat.lport.emit_unbind_local()
+            self._uninstall_pat_ingress_flows(pat)
+            for pat_entry in self._get_pat_entries_by_pat(pat):
+                self._uninstall_pat_entry_ingress_flows(pat_entry)
         else:
             pat.lport.emit_unbind_remote()
 
+        for pat_entry in self._get_pat_entries_by_pat(pat):
+            if pat_entry.lport.is_local:
+                self._uninstall_egress_flows(pat_entry)
+
     @df_base_app.register_event(l3.PATEntry, model_constants.EVENT_CREATED)
     def _create_pat_entry(self, pat_entry):
+        if pat_entry.pat.chassis is None: return
+        LOG.debug('Creating flows for PATEntry {}'.format(pat_entry))
         # Only the controller, C1, local to the PAT's port installs ingress
         # flows. This avoids having all controllers install flows for all PAT
         # entries (at the cost of all forward packets going through C1).
@@ -275,6 +305,8 @@ class PATApp(df_base_app.DFlowApp):
 
     @df_base_app.register_event(l3.PATEntry, model_constants.EVENT_DELETED)
     def _delete_pat_entry(self, pat_entry):
+        if pat_entry.pat.chassis is None: return
+        LOG.debug('Deleting flows for PATEntry {}'.format(pat_entry))
         if pat_entry.pat.lport.is_local:
             self._uninstall_pat_entry_ingress_flows(pat_entry)
         if pat_entry.lport.is_local:
