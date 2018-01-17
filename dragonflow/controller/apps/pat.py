@@ -1,4 +1,4 @@
-# Copyright (c) 2015 OpenStack Foundation.
+# Copyright (c) 2018 OpenStack Foundation.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,17 +14,27 @@
 #    under the License.
 
 from neutron_lib import constants as n_const
-from oslo_config import cfg
 from oslo_log import log
-from ryu.lib.packet import ethernet, icmp, in_proto, ipv4, packet
+from ryu.lib.packet import ethernet
+from ryu.lib.packet import icmp
+from ryu.lib.packet import in_proto
+from ryu.lib.packet import ipv4
+from ryu.lib.packet import packet
+from ryu.lib.packet import tcp
 from ryu.ofproto import ether
 
-from dragonflow import conf as cfg
 from dragonflow.common import utils as df_utils
-from dragonflow.controller import df_base_app, port_locator
-from dragonflow.controller.common import arp_responder, constants as const, \
-    icmp_error_generator
-from dragonflow.db.models import constants as model_constants, l2, l3
+from dragonflow import conf as cfg
+from dragonflow.controller.common import arp_responder
+from dragonflow.controller.common import constants as const
+from dragonflow.controller.common import icmp_error_generator
+from dragonflow.controller.common import icmp_responder
+from dragonflow.controller import df_base_app
+from dragonflow.controller import port_locator
+from dragonflow.db.models import constants as model_constants
+from dragonflow.db.models import l2
+from dragonflow.db.models import l3
+
 
 LOG = log.getLogger(__name__)
 
@@ -36,9 +46,108 @@ INGRESS = 'ingress'
 class PATApp(df_base_app.DFlowApp):
     def __init__(self, *args, **kwargs):
         super(PATApp, self).__init__(*args, **kwargs)
-        # PATApp is currently piggy-backing on the DNATApp, so it doesn't
-        # create its own tables and therefore will not handle packet misses.
-        # TODO(pino): handle ICMP errors separate from DNATApp.
+        self.conf = cfg.CONF.df_dnat_app
+        self.egress_ttl_invalid_handler_rate_limit = df_utils.RateLimiter(
+            max_rate=self.conf.dnat_ttl_invalid_max_rate,
+            time_unit=1)
+        self.ingress_ttl_invalid_handler_rate_limit = df_utils.RateLimiter(
+            max_rate=self.conf.dnat_ttl_invalid_max_rate,
+            time_unit=1)
+        self.egress_icmp_error_rate_limit = df_utils.RateLimiter(
+            max_rate=self.conf.dnat_icmp_error_max_rate,
+            time_unit=1)
+        self.ingress_icmp_error_rate_limit = df_utils.RateLimiter(
+            max_rate=self.conf.dnat_icmp_error_max_rate,
+            time_unit=1)
+        self.api.register_table_handler(const.INGRESS_PAT_TABLE,
+                                        self.ingress_packet_in_handler)
+        self.api.register_table_handler(const.EGRESS_PAT_TABLE,
+                                        self.egress_packet_in_handler)
+
+    def _handle_ingress_invalid_ttl(self, event):
+        if self.ingress_ttl_invalid_handler_rate_limit():
+            LOG.warning("Get more than %(rate)s TTL invalid "
+                        "packets per second at table %(table)s",
+                        {'rate': self.conf.dnat_ttl_invalid_max_rate,
+                         'table': const.INGRESS_PAT_TABLE})
+            return
+
+        msg = event.msg
+
+        icmp_ttl_pkt = icmp_error_generator.generate(
+            icmp.ICMP_TIME_EXCEEDED, icmp.ICMP_TTL_EXPIRED_CODE, msg.data)
+        network_id = msg.match.get('metadata')
+        self.reinject_packet(
+            icmp_ttl_pkt,
+            table_id=const.L2_LOOKUP_TABLE,
+            actions=[self.parser.OFPActionSetField(metadata=network_id)]
+        )
+
+    def _handle_ingress_icmp_translate(self, event):
+        #TODO(pino): finish this implementation
+        return
+        '''
+        if self.ingress_icmp_error_rate_limit():
+            LOG.warning("Get more than %(rate)s ICMP error messages "
+                        "per second at table %(table)s",
+                        {'rate': self.conf.dnat_icmp_error_max_rate,
+                         'table': const.INGRESS_PAT_TABLE})
+            return
+
+        msg = event.msg
+        pkt = packet.Packet(msg.data)
+        e_pkt = pkt.get_protocol(ethernet.ethernet)
+        ipv4_pkt = pkt.get_protocol(ipv4.ipv4)
+        ipv4_pkt.csum = 0
+        icmp_pkt = pkt.get_protocol(icmp.icmp)
+        embeded_ipv4_pkt, _, payload = ipv4.ipv4.parser(icmp_pkt.data.data)
+        embeded_tcp_pkt = embeded_ipv4_pkt.get_protocol(tcp.tcp)
+        pat_l4_port = embeded_tcp_pkt.src_port
+        pat_lport = self.db_store.get_one(
+            l2.LogicalPort(unique_key=msg.match.get('reg7')),
+            index=l2.LogicalPort.get_index('unique_key'),
+        )
+        pat = self.db_store.get_one(
+            l3.PAT(lport=pat_lport.id),
+            index=l3.PAT.get_index('lport'),
+        )
+        if pat is None:
+            LOG.warning("PAT not found for ingress ICMP error.")
+            return
+        # TODO(pino): index by pat and L4 port
+        pat_entry = None
+        for e in self._get_pat_entries_by_pat(pat):
+            if e.pat_l4_port is pat_l4_port:
+                pat_entry = e
+                break
+        if pat is None:
+            LOG.warning("PATEntry not found for ingress ICMP error.")
+            return
+        embeded_ipv4_pkt.dst = None
+        embeded_tcp_pkt.src_port = None
+
+        embeded_data = embeded_ipv4_pkt.serialize(None, None) + payload
+        icmp_pkt.data.data = embeded_data
+        # Re-calculate when encoding
+        icmp_pkt.csum = 0
+
+        reply_pkt = packet.Packet()
+        reply_pkt.add_protocol(e_pkt)
+        reply_pkt.add_protocol(ipv4_pkt)
+        reply_pkt.add_protocol(icmp_pkt)
+        port_key = msg.match.get('reg7')
+        self.dispatch_packet(reply_pkt, port_key)
+        '''
+
+    def ingress_packet_in_handler(self, event):
+        if event.msg.reason == self.ofproto.OFPR_INVALID_TTL:
+            self._handle_ingress_invalid_ttl(event)
+        else:
+            self._handle_ingress_icmp_translate(event)
+
+    def egress_packet_in_handler(self, event):
+        # TODO(pino): implement this
+        return
 
     def _get_vm_gateway_mac(self, pat_entry):
         for router_port in pat_entry.lrouter.ports:
@@ -119,24 +228,69 @@ class PATApp(df_base_app.DFlowApp):
             parser.OFPActionSetField(reg6=pat_entry.pat.lport.unique_key)
         ]
 
+    def _get_ingress_icmp_flow_match(self, pat, icmp_type):
+        return self.parser.OFPMatch(
+            reg7=pat.lport.unique_key,
+            eth_type=ether.ETH_TYPE_IP,
+            ip_proto=in_proto.IPPROTO_ICMP,
+            icmpv4_type=icmp_type,
+        )
+
+    def _install_ingress_icmp_flows(self, pat):
+        # Translate flow
+        # Add flows to packet-in icmp time exceed and icmp unreachable message
+        for icmp_type in (icmp.ICMP_DEST_UNREACH, icmp.ICMP_TIME_EXCEEDED):
+            self.mod_flow(
+                table_id=const.INGRESS_PAT_TABLE,
+                priority=const.PRIORITY_HIGH,
+                match=self._get_ingress_icmp_flow_match(pat, icmp_type),
+                actions= [
+                    self.parser.OFPActionOutput(
+                        self.ofproto.OFPP_CONTROLLER,
+                        self.ofproto.OFPCML_NO_BUFFER,
+                    ),
+                ],
+            )
+
+    def _uninstall_ingress_icmp_flows(self, pat):
+        for icmp_type in (icmp.ICMP_DEST_UNREACH, icmp.ICMP_TIME_EXCEEDED):
+            self.mod_flow(
+                command=self.ofproto.OFPFC_DELETE_STRICT,
+                table_id=const.INGRESS_PAT_TABLE,
+                priority=const.PRIORITY_HIGH,
+                match=self._get_ingress_icmp_flow_match(pat, icmp_type),
+            )
+
     def _install_pat_ingress_flows(self, pat):
         match = self._get_pat_ingress_match(pat)
         arp = self._get_arp_responder(pat)
         arp.add()
         LOG.debug('install ingress flows for PAT {} with match {} and ARP '
                   '{}'.format(pat, match, arp))
+        icmp_responder.ICMPResponder(
+            app=self,
+            network_id=pat.lport.lswitch.unique_key,
+            interface_ip=pat.ip_address,
+        ).add()
+        self._install_ingress_icmp_flows(pat)
         self.mod_flow(
             table_id=const.EGRESS_TABLE,
             priority=const.PRIORITY_HIGH,
             match=match,
             inst=[
-                self.parser.OFPInstructionGotoTable(const.INGRESS_DNAT_TABLE),
+                self.parser.OFPInstructionGotoTable(const.INGRESS_PAT_TABLE),
             ],
         )
 
     def _uninstall_pat_ingress_flows(self, pat):
         LOG.debug('uninstall ingress flows for PAT {}'.format(pat))
         self._get_arp_responder(pat).remove()
+        icmp_responder.ICMPResponder(
+            app=self,
+            network_id=pat.lport.lswitch.unique_key,
+            interface_ip=pat.ip_address,
+        ).remove()
+        self._uninstall_ingress_icmp_flows(pat)
         self.mod_flow(
             command=self.ofproto.OFPFC_DELETE_STRICT,
             table_id=const.EGRESS_TABLE,
@@ -149,12 +303,12 @@ class PATApp(df_base_app.DFlowApp):
         nat_actions = self._get_ingress_nat_actions(pat_entry) + [
                 self.parser.NXActionResubmitTable(
                     table_id=const.L2_LOOKUP_TABLE)]
-        LOG.debug('install egress flows for PATEntry {} with match {} '
+        LOG.debug('install ingress flows for PATEntry {} with match {} '
                   'and translation {}'.format(pat_entry,
                                               match,
                                               nat_actions))
         self.mod_flow(
-            table_id=const.INGRESS_DNAT_TABLE,
+            table_id=const.INGRESS_PAT_TABLE,
             priority=const.PRIORITY_MEDIUM,
             match=match,
             actions=nat_actions,
@@ -164,7 +318,7 @@ class PATApp(df_base_app.DFlowApp):
         LOG.debug('uninstall ingress flows for PATEntry {}'.format(pat_entry))
         self.mod_flow(
             command=self.ofproto.OFPFC_DELETE_STRICT,
-            table_id=const.INGRESS_DNAT_TABLE,
+            table_id=const.INGRESS_PAT_TABLE,
             priority=const.PRIORITY_MEDIUM,
             match=self._get_pat_entry_ingress_match(pat_entry),
         )
@@ -178,17 +332,16 @@ class PATApp(df_base_app.DFlowApp):
                   'and translation {}'.format(pat_entry,
                                               match,
                                               nat_actions))
-        # Capture flow: relevant packets in L3 go to EGRESS_DNAT
         self.mod_flow(
             table_id=const.L3_LOOKUP_TABLE,
             priority=const.PRIORITY_MEDIUM_LOW,
             match=match,
             inst=[
-                self.parser.OFPInstructionGotoTable(const.EGRESS_DNAT_TABLE)
+                self.parser.OFPInstructionGotoTable(const.EGRESS_PAT_TABLE)
             ],
         )
         self.mod_flow(
-            table_id=const.EGRESS_DNAT_TABLE,
+            table_id=const.EGRESS_PAT_TABLE,
             priority=const.PRIORITY_MEDIUM,
             match=match,
             actions=nat_actions,
@@ -204,7 +357,7 @@ class PATApp(df_base_app.DFlowApp):
         )
         self.mod_flow(
             command=self.ofproto.OFPFC_DELETE_STRICT,
-            table_id=const.EGRESS_DNAT_TABLE,
+            table_id=const.EGRESS_PAT_TABLE,
             priority=const.PRIORITY_MEDIUM,
             match=self._get_egress_match(pat_entry),
         )
