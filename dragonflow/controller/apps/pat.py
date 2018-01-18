@@ -28,7 +28,6 @@ from dragonflow import conf as cfg
 from dragonflow.controller.common import arp_responder
 from dragonflow.controller.common import constants as const
 from dragonflow.controller.common import icmp_error_generator
-from dragonflow.controller.common import icmp_responder
 from dragonflow.controller import df_base_app
 from dragonflow.controller import port_locator
 from dragonflow.db.models import constants as model_constants
@@ -140,12 +139,14 @@ class PATApp(df_base_app.DFlowApp):
         '''
 
     def ingress_packet_in_handler(self, event):
+        LOG.debug("Ingress PAT table packet-in event {}".format(event))
         if event.msg.reason == self.ofproto.OFPR_INVALID_TTL:
             self._handle_ingress_invalid_ttl(event)
         else:
             self._handle_ingress_icmp_translate(event)
 
     def egress_packet_in_handler(self, event):
+        LOG.debug("Egress PAT table packet-in event {}".format(event))
         # TODO(pino): implement this
         return
 
@@ -154,6 +155,46 @@ class PATApp(df_base_app.DFlowApp):
             if router_port.lswitch.id == pat_entry.lport.lswitch.id:
                 return router_port.mac
         return None
+
+    def _icmp_echo_match(self, pat):
+        return self.parser.OFPMatch(
+            reg7=pat.lport.unique_key,
+            eth_type=ether.ETH_TYPE_IP,
+            ip_proto=in_proto.IPPROTO_ICMP,
+            ipv4_dst=pat.ip_address,
+            icmpv4_type = icmp.ICMP_ECHO_REQUEST,
+        )
+
+    def _add_icmp_echo_responder(self, pat):
+        parser = self.parser
+        actions = [
+            parser.OFPActionSetNwTtl(64),
+            parser.OFPActionSetField(eth_dst=const.EMPTY_MAC),
+            parser.OFPActionSetField(eth_src=pat.lport.mac),
+            parser.NXActionRegMove(src_field='ipv4_src',
+                                   dst_field='ipv4_dst',
+                                   n_bits=32),
+            parser.OFPActionSetField(ipv4_src=pat.ip_address),
+            parser.OFPActionSetField(icmpv4_type=icmp.ICMP_ECHO_REPLY),
+            parser.OFPActionSetField(metadata=pat.lport.lswitch.unique_key),
+            parser.OFPActionSetField(reg6=pat.lport.unique_key),
+            parser.OFPActionSetField(reg7=0),
+            parser.NXActionResubmitTable(table_id=const.L2_LOOKUP_TABLE),
+        ]
+        self.mod_flow(
+            table_id=const.EGRESS_TABLE,
+            priority=const.PRIORITY_VERY_HIGH,
+            match=self._icmp_echo_match(pat),
+            actions=actions,
+        )
+
+    def _remove_icmp_echo_responder(self, pat):
+        self.mod_flow(
+            command=self.ofproto.OFPFC_DELETE_STRICT,
+            table_id=const.EGRESS_TABLE,
+            priority=const.PRIORITY_VERY_HIGH,
+            match=self._icmp_echo_match(pat),
+        )
 
     def _get_arp_responder(self, pat):
         # ARP responder is placed in L2. This is needed to avoid the multicast
@@ -267,11 +308,7 @@ class PATApp(df_base_app.DFlowApp):
         arp.add()
         LOG.debug('install ingress flows for PAT {} with match {} and ARP '
                   '{}'.format(pat, match, arp))
-        icmp_responder.ICMPResponder(
-            app=self,
-            network_id=pat.lport.lswitch.unique_key,
-            interface_ip=pat.ip_address,
-        ).add()
+        self._add_icmp_echo_responder(pat)
         self._install_ingress_icmp_flows(pat)
         self.mod_flow(
             table_id=const.EGRESS_TABLE,
@@ -285,11 +322,7 @@ class PATApp(df_base_app.DFlowApp):
     def _uninstall_pat_ingress_flows(self, pat):
         LOG.debug('uninstall ingress flows for PAT {}'.format(pat))
         self._get_arp_responder(pat).remove()
-        icmp_responder.ICMPResponder(
-            app=self,
-            network_id=pat.lport.lswitch.unique_key,
-            interface_ip=pat.ip_address,
-        ).remove()
+        self._remove_icmp_echo_responder(pat)
         self._uninstall_ingress_icmp_flows(pat)
         self.mod_flow(
             command=self.ofproto.OFPFC_DELETE_STRICT,
@@ -334,7 +367,7 @@ class PATApp(df_base_app.DFlowApp):
                                               nat_actions))
         self.mod_flow(
             table_id=const.L3_LOOKUP_TABLE,
-            priority=const.PRIORITY_MEDIUM_LOW,
+            priority=const.PRIORITY_HIGH,
             match=match,
             inst=[
                 self.parser.OFPInstructionGotoTable(const.EGRESS_PAT_TABLE)
@@ -352,7 +385,7 @@ class PATApp(df_base_app.DFlowApp):
         self.mod_flow(
             command=self.ofproto.OFPFC_DELETE_STRICT,
             table_id=const.L3_LOOKUP_TABLE,
-            priority=const.PRIORITY_MEDIUM_LOW,
+            priority=const.PRIORITY_HIGH,
             match=self._get_egress_match(pat_entry),
         )
         self.mod_flow(
